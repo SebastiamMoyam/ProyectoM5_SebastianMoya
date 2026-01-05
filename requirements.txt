@@ -7,3 +7,5 @@ pycaret
 jupyter
 openpyxl
 xgboost
+streamlit
+evidently
