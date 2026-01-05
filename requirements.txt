@@ -6,3 +6,4 @@ scikit-learn
 pycaret
 jupyter
 openpyxl
+xgboost

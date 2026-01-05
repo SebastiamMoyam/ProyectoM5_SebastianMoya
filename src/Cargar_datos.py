@@ -15,9 +15,10 @@ def cargarDatos():
     # 4. Leemos los datos y los imprimimos 
     df = pd.read_excel(ruta_excel)
 
+    columnas_trampa = ['puntaje', 'saldo_mora', 'saldo_mora_codeudor', 'saldo_total', 'saldo_principal','fecha_prestamo']
+    df = df.drop(columns=columnas_trampa, errors='ignore')
 
     return df
 
-# if __name__ == "__main__":
-#     datos = cargarDatos()
-#     datos.head()
+if __name__ == "__main__":
+    datos = cargarDatos()
