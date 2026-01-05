@@ -1,240 +1,172 @@
-# model_monitoring.py
-import os
-import time
-import pandas as pd
-import requests
 import streamlit as st
-st.set_page_config(page_title="Monitoreo del Modelo", layout="wide")
+import pandas as pd
+import numpy as np
+import joblib
 import plotly.express as px
 import plotly.graph_objects as go
-from evidently import Report 
-from evidently.presets import DataDriftPreset
-from sklearn.model_selection import train_test_split
-from Cargar_datos import cargarDatos
-# ================================
-# 1. Configuración
-# ================================
-API_URL = "http://localhost:8000/predict_batch"
-DATASET_PATH = "./Base_de_datos.xlsx"   # dataset transformado
-MONITOR_LOG = "./Base_de_datos.csv"  #dataset para monitorear
+import os
+import sys
 
-# ================================
-# 2. Cargar dataset y dividir
-# ================================
-@st.cache_data
-def load_data():
-    #df = pd.read_excel(DATASET_PATH)
-    df = cargarDatos()
-    target = "Pago_atiempo"
-    X = df.drop(columns=[target])
-    y = df[target]
-    X_ref, X_new, y_ref, y_new = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-    return X_ref, X_new, y_ref, y_new
+try:
+    from Cargar_datos import Cargar_datos
+    from ft_engineering import FeatureEngineering
+except ImportError:
 
-X_ref, X_new, y_ref, y_new = load_data()
+    sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
+    from src.Cargar_datos import Cargar_datos
+    from src.ft_engineering import FeatureEngineering
 
-# ================================
-# 3. API para predicciones
-# ================================
-def get_predictions(X_batch: pd.DataFrame):
-    payload = {"batch": X_batch.values.tolist()}
+st.set_page_config(page_title="Tablero de Monitoreo", layout="wide", page_icon="📈")
+
+DATASET_PATH = "./Base_de_datos.xlsx"  # Ajusta según tu estructura
+MODEL_PATHS = ["src/best_model.pkl", "best_model.pkl", "../src/best_model.pkl"]
+LOG_FILE = "src/monitoring_log.csv"
+
+@st.cache_resource
+def load_resources():
+
+    model = None
+    for path in MODEL_PATHS:
+        try:
+            model = joblib.load(path)
+            break
+        except:
+            continue
+            
+    if model is None:
+        return None, None
+
     try:
-        response = requests.post(API_URL, json=payload)
-        response.raise_for_status()
-        preds = response.json()["predictions"]
-        return preds
+        possible_data_paths = ["../Base_de_datos.xlsx", "Base_de_datos.xlsx"]
+        df = None
+        for dp in possible_data_paths:
+            if os.path.exists(dp):
+                loader = Cargar_datos(dp)
+                df = loader.carga_datos()
+                break
+        
+        if df is None:
+            return None, None
+
+        fe = FeatureEngineering(df, target_col='Pago_atiempo')
+        fe._drop_manual_columns()
+        fe._remove_highly_correlated_features(threshold=0.85)
+        reference_data = fe.df.copy()
+        
+        return model, reference_data
     except Exception as e:
-        st.error(f"❌ Error conectando con la API: {e}")
-        return None
+        return None, None
 
-# ================================
-# 4. Guardar logs con timestamp
-# ================================
-def log_predictions(X_batch, preds):
-    log_df = X_batch.copy()
-    log_df["prediction"] = preds
-    log_df["timestamp"] = pd.Timestamp.now()
+model, reference_data = load_resources()
 
-    if os.path.exists(MONITOR_LOG):
-        log_df.to_csv(MONITOR_LOG, mode="a", header=False, index=False)
-    else:
-        log_df.to_csv(MONITOR_LOG, index=False)
 
-# ================================
-# 5. Reporte Evidently
-# ================================
-def generate_drift_report(ref_data, new_data):
-    report = Report(metrics=[DataDriftPreset()])
-    report.run(reference_data=ref_data, current_data=new_data)
-    return report
-
-# ================================
-# 6. Streamlit UI con gráficas
-# ================================
-#st.set_page_config(page_title="Monitoreo del Modelo", layout="wide")
-st.title("📊 Monitoreo del Modelo en Producción")
-
-# Métricas principales en la parte superior
-if os.path.exists(MONITOR_LOG):
-    logged_data = pd.read_csv(MONITOR_LOG)
+def simulate_new_predictions(n_samples=50):
+    if reference_data is None: return None
     
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Total Predicciones", len(logged_data))
-    with col2:
-        st.metric("Predicción Promedio", f"{logged_data['prediction'].mean():.3f}")
-    with col3:
-        st.metric("Desviación Estándar", f"{logged_data['prediction'].std():.3f}")
-    with col4:
-        positive_rate = (logged_data['prediction'] > 0.5).mean() * 100
-        st.metric("Tasa Positiva (%)", f"{positive_rate:.1f}%")
+    new_data = reference_data.sample(n=n_samples, replace=True).copy()
 
-st.sidebar.header("Opciones")
-sample_size = st.sidebar.slider("Tamaño de muestra para monitoreo:", 50, 500, 200)
+    new_data['salario_cliente'] = new_data['salario_cliente'] * np.random.uniform(1.05, 1.20, size=len(new_data))
+    new_data['capital_prestado'] = new_data['capital_prestado'] * 1.10
+    
+    cat_cols = new_data.select_dtypes(include=['object', 'category']).columns
+    for col in cat_cols:
+        new_data[col] = new_data[col].astype(str)
+        
+    preds = model.predict(new_data)
+    new_data['prediction'] = preds
+    new_data['timestamp'] = pd.Timestamp.now()
+    
+    return new_data
 
-if st.button("🔄 Generar nuevas predicciones y actualizar log"):
-    sample = X_new.sample(n=sample_size, random_state=int(time.time()))
-    preds = get_predictions(sample)
-    if preds:
-        log_predictions(sample, preds)
-        st.success("✅ Nuevas predicciones agregadas al log.")
+st.title("📈 Dashboard de Monitoreo (Producción)")
+
+if model is None:
+    st.error("Error: No se encontró el modelo ('best_model.pkl') o la base de datos.")
+    st.stop()
+
+current_data = pd.DataFrame()
+
+if os.path.exists(LOG_FILE):
+    try:
+        current_data = pd.read_csv(LOG_FILE)
+    except:
+        current_data = pd.DataFrame()
+
+# --- BARRA LATERAL ---
+st.sidebar.header("⚙️ Panel de Control")
+
+if st.sidebar.button("🔄 Simular llegada de clientes"):
+    with st.spinner("Procesando nuevos datos..."):
+        new_batch = simulate_new_predictions(n_samples=50)
+        
+        if new_batch is not None:
+            # Guardar en CSV
+            if not current_data.empty:
+                new_batch.to_csv(LOG_FILE, mode='a', header=False, index=False)
+            else:
+                new_batch.to_csv(LOG_FILE, index=False)
+            
+            # Recargar datos inmediatamente para actualizar gráficas
+            current_data = pd.concat([current_data, new_batch], ignore_index=True)
+            st.sidebar.success(f"✅ Se procesaron {len(new_batch)} solicitudes.")
+            st.rerun() # Recarga la página para mostrar los datos nuevos
+
+if st.sidebar.button("🗑️ Reiniciar Historial"):
+    if os.path.exists(LOG_FILE):
+        os.remove(LOG_FILE)
+        current_data = pd.DataFrame() # Limpiamos la variable en memoria
+        st.sidebar.warning("Historial eliminado.")
         st.rerun()
 
-# Mostrar datos y gráficas
-if os.path.exists(MONITOR_LOG):
-    logged_data = pd.read_csv(MONITOR_LOG)
+# --- VISUALIZACIÓN DEL DASHBOARD ---
+# Aquí verificamos si hay datos ANTES de intentar graficar
+if current_data.empty:
+    st.info("👋 **Bienvenido al sistema de monitoreo.**")
+    st.markdown("No hay datos registrados todavía.")
+    st.markdown("👉 **Presiona el botón 'Simular llegada de clientes' en la barra lateral para generar datos de prueba.**")
     
-    # Crear tabs para organizar mejor
-    tab1, tab2, tab3 = st.tabs(["📈 Gráficas", "📊 Data Drift", "📂 Logs"])
-    
-    with tab1:
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Histograma de predicciones
-            fig_hist = px.histogram(
-                logged_data, 
-                x='prediction', 
-                nbins=20,
-                title="Distribución de Predicciones",
-                color_discrete_sequence=['#1f77b4']
-            )
-            st.plotly_chart(fig_hist, width="stretch")
-        
-        with col2:
-            # Gráfico de línea temporal (si hay timestamp)
-            if 'timestamp' in logged_data.columns:
-                logged_data['timestamp'] = pd.to_datetime(logged_data['timestamp'])
-                # Agrupar por minuto para mejor visualización
-                temporal_data = logged_data.groupby(
-                    logged_data['timestamp'].dt.floor('T')
-                )['prediction'].mean().reset_index()
-                
-                fig_time = px.line(
-                    temporal_data, 
-                    x='timestamp', 
-                    y='prediction',
-                    title="Evolución Temporal de Predicciones",
-                    color_discrete_sequence=['#ff7f0e']
-                )
-                st.plotly_chart(fig_time, width="stretch")
-            else:
-                # Box plot como alternativa
-                fig_box = px.box(
-                    logged_data, 
-                    y='prediction',
-                    title="Distribución de Predicciones (Box Plot)"
-                )
-                st.plotly_chart(fig_box, width="stretch")
-        
-        # Gráfico de comparación con datos de referencia
-        st.subheader("🔍 Comparación con Datos de Referencia")
-        
-        # Seleccionar algunas columnas numéricas para comparar
-        numeric_cols = logged_data.select_dtypes(include=['float64', 'int64']).columns
-        numeric_cols = [col for col in numeric_cols if col != 'prediction'][:4]  # Solo las primeras 4
-        
-        if len(numeric_cols) > 0:
-            comparison_data = []
-            for col in numeric_cols:
-                if col in X_ref.columns:
-                    comparison_data.append({
-                        'Feature': col,
-                        'Referencia': X_ref[col].mean(),
-                        'Actual': logged_data[col].mean(),
-                        'Dataset': 'Comparación'
-                    })
-            
-            if comparison_data:
-                comp_df = pd.DataFrame(comparison_data)
-                
-                fig_comp = go.Figure()
-                fig_comp.add_trace(go.Bar(
-                    name='Referencia',
-                    x=comp_df['Feature'],
-                    y=comp_df['Referencia'],
-                    marker_color='lightblue'
-                ))
-                fig_comp.add_trace(go.Bar(
-                    name='Actual',
-                    x=comp_df['Feature'],
-                    y=comp_df['Actual'],
-                    marker_color='orange'
-                ))
-                
-                fig_comp.update_layout(
-                    title="Comparación de Medias: Referencia vs Actual",
-                    barmode='group'
-                )
-                st.plotly_chart(fig_comp, width="stretch")
-    
-    with tab2:
-        st.subheader("📊 Reporte de Data Drift")
-        drift_report = generate_drift_report(
-            X_ref, logged_data.drop(columns=["prediction", "timestamp"], errors="ignore")
-        )
-
-        # Mostrar reporte
-        try:
-            st.components.v1.html(drift_report._repr_html_(), height=1000, scrolling=True)
-        except:
-            st.write("✅ Reporte de Drift generado exitosamente")
-            st.write(f"📊 Datos de referencia: {X_ref.shape}, Datos actuales: {logged_data.drop(columns=['prediction', 'timestamp'], errors='ignore').shape}")
-            
-            # Mostrar métricas básicas de drift
-            try:
-                drift_data = drift_report.as_dict()
-                if 'metrics' in drift_data and len(drift_data['metrics']) > 0:
-                    dataset_drift = drift_data['metrics'][0].get('result', {}).get('dataset_drift', 'No disponible')
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("Dataset Drift Detectado", "Sí" if dataset_drift else "No")
-                    with col2:
-                        # Contar cuántas features tienen drift
-                        feature_drifts = drift_data['metrics'][0].get('result', {}).get('drift_by_columns', {})
-                        drift_count = sum(1 for v in feature_drifts.values() if v) if feature_drifts else 0
-                        st.metric("Features con Drift", f"{drift_count}/{len(feature_drifts)}" if feature_drifts else "0")
-            except:
-                pass
-    
-    with tab3:
-        st.subheader("📂 Log de Monitoreo")
-        
-        # Filtro para mostrar más o menos filas
-        show_rows = st.selectbox("Mostrar últimas:", [10, 25, 50, 100], index=0)
-        st.dataframe(logged_data.tail(show_rows), width="stretch")
-        
-        # Botón de descarga
-        csv = logged_data.to_csv(index=False)
-        st.download_button(
-            label="📥 Descargar CSV completo",
-            data=csv,
-            file_name=f"monitoring_log_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv"
-        )
-
 else:
-    st.warning("⚠️ No hay datos de monitoreo aún. Presiona el botón para iniciar.")
+    # SI HAY DATOS, MOSTRAR TABS
+    tab1, tab2, tab3 = st.tabs(["📊 Desempeño", "🚨 Detección de Cambios (Drift)", "📂 Datos Crudos"])
+
+    with tab1:
+        st.subheader("Métricas de Operación")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1: st.metric("Total Solicitudes", len(current_data))
+        with col2: st.metric("Tasa Aprobación", f"{(current_data['prediction'] == 1).mean():.1%}")
+        with col3: st.metric("Monto Promedio", f"${current_data['capital_prestado'].mean():,.0f}")
+        with col4: st.metric("Salario Promedio", f"${current_data['salario_cliente'].mean():,.0f}")
+        
+        st.divider()
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            counts = current_data['prediction'].value_counts().reset_index()
+            counts.columns = ['Resultado', 'Cantidad']
+            counts['Resultado'] = counts['Resultado'].map({1: 'Aprobado', 0: 'Rechazado'})
+            fig_pie = px.pie(counts, values='Cantidad', names='Resultado', title="Distribución de Decisiones", 
+                             color='Resultado', color_discrete_map={'Aprobado':'green', 'Rechazado':'red'})
+            st.plotly_chart(fig_pie, use_container_width=True)
+        with c2:
+            fig_hist = px.histogram(current_data, x="salario_cliente", title="Distribución de Salarios Actuales")
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+    with tab2:
+        st.subheader("Comparativo: Entrenamiento vs. Producción")
+        col_drift1, col_drift2 = st.columns(2)
+        with col_drift1:
+            fig_box1 = go.Figure()
+            fig_box1.add_trace(go.Box(y=reference_data['salario_cliente'], name='Entrenamiento', marker_color='blue'))
+            fig_box1.add_trace(go.Box(y=current_data['salario_cliente'], name='Producción', marker_color='orange'))
+            fig_box1.update_layout(title="Comparación: Salarios")
+            st.plotly_chart(fig_box1, use_container_width=True)
+        with col_drift2:
+            fig_box2 = go.Figure()
+            fig_box2.add_trace(go.Box(y=reference_data['capital_prestado'], name='Entrenamiento', marker_color='blue'))
+            fig_box2.add_trace(go.Box(y=current_data['capital_prestado'], name='Producción', marker_color='orange'))
+            fig_box2.update_layout(title="Comparación: Monto Solicitado")
+            st.plotly_chart(fig_box2, use_container_width=True)
+
+    with tab3:
+        st.dataframe(current_data.tail(100))
+        st.download_button("Descargar Reporte CSV", current_data.to_csv(index=False), "reporte.csv", "text/csv")
